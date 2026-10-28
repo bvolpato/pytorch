@@ -636,6 +636,82 @@ AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cuda_caching_allocator_raw_alloc(
 AOTI_TORCH_EXPORT AOTITorchError
 aoti_torch_cuda_caching_allocator_raw_delete(void* ptr);
 
+#if TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+// CUDA graph capture for generated code. These wrap at::cuda::MemPool and
+// at::cuda::CUDAGraph, so a capture allocates from a private pool, and random
+// number generators advance on every replay.
+//
+// A graph handle captures once: after capture_end it can only be replayed,
+// if it was instantiated, and deleted. Deleting it frees the graph and its
+// reference to the pool's memory.
+//
+// A pool and the graphs captured into it must be used by one thread at a time.
+// AOTI runs each inference thread on its own model instance and stream, and
+// each instance has its own pool and graphs; thread-local capture mode lets
+// other threads keep launching work while one captures. A pool takes one
+// capture at a time, and graphs captured into it one after another share its
+// memory. Once every graph captured into a pool is deleted, the pool can't take
+// another capture. A graph whose capture_begin failed counts too, unless the
+// call was rejected for its arguments: a null handle, a blocking stream or one
+// that is already capturing, a pool that is already capturing, or a graph that
+// already captured.
+//
+// Graphs captured into one pool reuse each other's memory: a graph captured
+// later can place its outputs in memory an earlier graph uses for temporaries.
+// So replays on different streams must be ordered, and a replay's outputs must
+// be used or copied before another graph in the pool replays, unless the
+// graphs are replayed in the order they were captured.
+struct CUDAMemPoolOpaque;
+using CUDAMemPoolHandle = CUDAMemPoolOpaque*;
+
+struct CUDAGraphOpaque;
+using CUDAGraphHandle = CUDAGraphOpaque*;
+
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_create_cuda_mem_pool(
+    int32_t device_index,
+    CUDAMemPoolHandle* ret_pool // returns new reference
+);
+
+// Graphs captured into the pool keep its memory until they are deleted.
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_delete_cuda_mem_pool(CUDAMemPoolHandle pool);
+
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_create_cuda_graph(
+    CUDAGraphHandle* ret_graph // returns new reference
+);
+
+// Deleting a graph that is being captured abandons the capture: the stream
+// stops capturing and the graph isn't instantiated. The graph is deleted even
+// if ending the capture reports an error, e.g. for an invalidated capture. On
+// another thread than the capture's, it fails and the handle stays valid.
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_delete_cuda_graph(CUDAGraphHandle graph);
+
+// Starts capturing the work enqueued on `stream`, which must belong to the
+// pool's device and be created with cudaStreamNonBlocking, in thread-local
+// capture mode. While a blocking stream captures, work that other threads
+// launch on the legacy default stream would invalidate the capture, so a
+// blocking stream is rejected. Memory allocated on `stream`
+// during the capture comes from `pool`. The capture must end on the thread
+// that began it; capture_end on another thread fails and leaves the capture
+// running.
+AOTI_TORCH_EXPORT AOTITorchError aoti_torch_cuda_graph_capture_begin(
+    CUDAGraphHandle graph,
+    CUDAMemPoolHandle pool,
+    void* stream);
+
+// Ends the capture and instantiates the graph for replay. The stream stops
+// capturing even when this returns an error, e.g. for an invalidated capture.
+// To abandon a capture, e.g. because the captured work failed, delete the
+// graph instead.
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_cuda_graph_capture_end(CUDAGraphHandle graph);
+
+// `stream` must belong to the device the graph was captured on.
+AOTI_TORCH_EXPORT AOTITorchError
+aoti_torch_cuda_graph_replay(CUDAGraphHandle graph, void* stream);
+#endif // TORCH_FEATURE_VERSION >= TORCH_VERSION_2_16_0
+
 #endif // USE_CUDA
 
 // See `ProxyExecutor Design Note` in ir.py for more details
